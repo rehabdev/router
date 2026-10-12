@@ -300,19 +300,11 @@ async fn handle_server_connection(
                 .read_datagram()
                 .await
                 .context("reading QUIC datagram")?;
-            if packet.len() > TUN_MTU as usize {
-                return Err(anyhow!("client sent a packet larger than the tunnel MTU"));
-            }
-            let (source, destination) =
-                validate_ipv4_packet(&packet).map_err(|err| anyhow!(err))?;
-            if source != assigned_ipv4
-                || !allowed_routes
-                    .iter()
-                    .any(|route| route.contains(&destination))
-            {
-                return Err(anyhow!(
-                    "client sent a packet outside its assigned source or route policy"
-                ));
+            if !client_packet_is_allowed(&packet, assigned_ipv4, &allowed_routes) {
+                // A connected client can still emit stale, malformed, or
+                // locally generated housekeeping traffic on its TUN device.
+                // Drop it without forwarding or destroying the whole session.
+                continue;
             }
             to_tun_tx
                 .send(packet.to_vec())
@@ -327,6 +319,23 @@ async fn handle_server_connection(
         .expect("session registry poisoned")
         .remove(&assigned_ipv4);
     result
+}
+
+fn client_packet_is_allowed(
+    packet: &[u8],
+    assigned_ipv4: Ipv4Addr,
+    allowed_routes: &[Ipv4Net],
+) -> bool {
+    if packet.len() > TUN_MTU as usize {
+        return false;
+    }
+    let Ok((source, destination)) = validate_ipv4_packet(packet) else {
+        return false;
+    };
+    source == assigned_ipv4
+        && allowed_routes
+            .iter()
+            .any(|route| route.contains(&destination))
 }
 
 fn reserve_client_ip(
@@ -892,10 +901,71 @@ fn default_key_path() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::make_client_config;
+    use std::net::Ipv4Addr;
+
+    use ipnet::Ipv4Net;
+
+    use super::{client_packet_is_allowed, make_client_config};
 
     #[test]
     fn client_crypto_provider_is_available() {
         make_client_config().expect("client TLS configuration should be constructible");
+    }
+
+    #[test]
+    fn invalid_client_packets_are_drop_only() {
+        let assigned = Ipv4Addr::new(10, 88, 0, 2);
+        let routes = vec!["198.51.100.0/24".parse::<Ipv4Net>().unwrap()];
+        assert!(!client_packet_is_allowed(&[], assigned, &routes));
+
+        let mut wrong_source = ipv4_test_packet(10, 88, 0, 3, 198, 51, 100, 8);
+        assert!(!client_packet_is_allowed(&wrong_source, assigned, &routes));
+
+        wrong_source[2] = 0;
+        wrong_source[3] = 21;
+        wrong_source.push(0);
+        assert!(!client_packet_is_allowed(&wrong_source, assigned, &routes));
+    }
+
+    #[test]
+    fn allowed_client_packet_matches_source_and_route_policy() {
+        let assigned = Ipv4Addr::new(10, 88, 0, 2);
+        let routes = vec!["198.51.100.0/24".parse::<Ipv4Net>().unwrap()];
+        let packet = ipv4_test_packet(10, 88, 0, 2, 198, 51, 100, 8);
+        assert!(client_packet_is_allowed(&packet, assigned, &routes));
+    }
+
+    fn ipv4_test_packet(
+        source_a: u8,
+        source_b: u8,
+        source_c: u8,
+        source_d: u8,
+        destination_a: u8,
+        destination_b: u8,
+        destination_c: u8,
+        destination_d: u8,
+    ) -> Vec<u8> {
+        vec![
+            0x45,
+            0,
+            0,
+            20,
+            0,
+            0,
+            0,
+            0,
+            64,
+            17,
+            0,
+            0,
+            source_a,
+            source_b,
+            source_c,
+            source_d,
+            destination_a,
+            destination_b,
+            destination_c,
+            destination_d,
+        ]
     }
 }
