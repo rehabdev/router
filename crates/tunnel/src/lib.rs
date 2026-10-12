@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use ipnet::Ipv4Net;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, IdleTimeout, RecvStream, SendStream};
 use rcgen::generate_simple_self_signed;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -27,7 +27,7 @@ use rustls::{
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, MissedTickBehavior};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tun::{create_as_async, AbstractDevice, AsyncDevice, TunPacketCodec};
 
@@ -42,6 +42,10 @@ const FIRST_CLIENT_HOST: u8 = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// This is an application-level liveness marker, not an IP packet. It is
+// consumed by the server and never written to either TUN device.
+const TUNNEL_HEARTBEAT: &[u8] = b"ASIRA-ROUTER-HEARTBEAT-V1";
 const AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-asira-router-auth-v1";
 const AUTH_EXPORTER_CONTEXT: &[u8] = b"asira-router-auth-v1";
 
@@ -300,6 +304,9 @@ async fn handle_server_connection(
                 .read_datagram()
                 .await
                 .context("reading QUIC datagram")?;
+            if packet.as_ref() == TUNNEL_HEARTBEAT {
+                continue;
+            }
             if !client_packet_is_allowed(&packet, assigned_ipv4, &allowed_routes) {
                 // A connected client can still emit stale, malformed, or
                 // locally generated housekeeping traffic on its TUN device.
@@ -421,6 +428,11 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let connection_for_task = connection.clone();
     let allowed_routes = config.routes.clone();
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + KEEP_ALIVE_INTERVAL,
+        KEEP_ALIVE_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let task_error = Arc::new(Mutex::new(None));
     let task_error_for_task = Arc::clone(&task_error);
     let metrics = Arc::new(ClientMetrics::default());
@@ -432,6 +444,12 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
                 _ = &mut shutdown_rx => {
                     connection_for_task.close(0u32.into(), b"client disconnect");
                     return Ok(());
+                }
+                _ = heartbeat.tick() => {
+                    connection_for_task
+                        .send_datagram_wait(Bytes::from_static(TUNNEL_HEARTBEAT))
+                        .await
+                        .context("sending tunnel heartbeat")?;
                 }
                 packet = tun_reader.next() => {
                     let Some(packet) = packet else { return Ok(()); };
@@ -792,6 +810,10 @@ fn transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(1u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
+    transport.max_idle_timeout(Some(
+        IdleTimeout::try_from(MAX_IDLE_TIMEOUT)
+            .expect("the configured QUIC idle timeout must fit in milliseconds"),
+    ));
     transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
     transport.datagram_receive_buffer_size(Some(1024 * 1024));
     transport.datagram_send_buffer_size(1024 * 1024);
@@ -905,7 +927,7 @@ mod tests {
 
     use ipnet::Ipv4Net;
 
-    use super::{client_packet_is_allowed, make_client_config};
+    use super::{client_packet_is_allowed, make_client_config, TUNNEL_HEARTBEAT};
 
     #[test]
     fn client_crypto_provider_is_available() {
@@ -917,6 +939,11 @@ mod tests {
         let assigned = Ipv4Addr::new(10, 88, 0, 2);
         let routes = vec!["198.51.100.0/24".parse::<Ipv4Net>().unwrap()];
         assert!(!client_packet_is_allowed(&[], assigned, &routes));
+        assert!(!client_packet_is_allowed(
+            TUNNEL_HEARTBEAT,
+            assigned,
+            &routes
+        ));
 
         let mut wrong_source = ipv4_test_packet(10, 88, 0, 3, 198, 51, 100, 8);
         assert!(!client_packet_is_allowed(&wrong_source, assigned, &routes));
