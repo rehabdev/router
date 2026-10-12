@@ -1,0 +1,8 @@
+target/
+dist/
+node_modules/
+apps/tauri-client/src-tauri/gen/
+*.user
+*.suo
+*.log
+
