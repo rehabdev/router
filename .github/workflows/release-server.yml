@@ -1,0 +1,56 @@
+name: Release Ubuntu server
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Ubuntu x86_64 server
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate and build
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked -p asira-protocol -p asira-tunnel -p asira-server
+          cargo build --locked --release -p asira-server
+
+      - name: Package release
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rm -rf release-package release-assets
+          mkdir -p release-package release-assets
+          install -m 0755 target/release/asira-server release-package/asira-server
+          install -m 0644 apps/server/server.toml.example release-package/server.toml.example
+          install -m 0644 packaging/systemd/asira-router.service release-package/asira-router.service
+          tar -C release-package -czf release-assets/asira-router-server-linux-x86_64.tar.gz .
+          (cd release-assets && sha256sum asira-router-server-linux-x86_64.tar.gz > SHA256SUMS)
+          sed "s#__ASIRA_ROUTER_REPOSITORY__#${RELEASE_REPOSITORY}#g" scripts/install-server.sh > release-assets/install-server.sh
+          chmod 0755 release-assets/install-server.sh
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" == "master" || "$tag" == "main" ]]; then
+            tag="manual-${GITHUB_SHA::12}"
+            gh release create "$tag" --target "$GITHUB_SHA" --title "Asira Router server $tag" --notes "Automated server build"
+          elif ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --title "Asira Router server $tag" --generate-notes
+          fi
+          gh release upload "$tag" release-assets/* --clobber
