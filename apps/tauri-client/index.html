@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#151515" />
+    <title>Asira Router</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="titlebar">
+        <div class="drag-region" id="drag-region" data-tauri-drag-region>
+          <img class="brand-logo" src="/asira_router_logo.svg" alt="" />
+          <span class="brand-name">Asira Router</span>
+        </div>
+
+        <nav class="app-nav" aria-label="Primary navigation">
+          <button class="nav-item is-active" type="button" data-page="home" aria-current="page">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 8L11.7317 3.13416C11.9006 3.04971 12.0994 3.0497 12.2683 3.13416L22 8" /><path d="M20 11V19C20 20.1046 19.1046 21 18 21H6C4.89543 21 4 20.1046 4 19V11" /></svg>
+            <span>Home</span>
+          </button>
+          <button class="nav-item" type="button" data-page="connection">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12V18C5 18 5 21 12 21C19 21 19 18 19 18V12" /><path d="M5 6V12C5 12 5 15 12 15C19 15 19 12 19 12V6" /><path d="M12 3C19 3 19 6 19 6C19 6 19 9 12 9C5 9 5 6 5 6C5 6 5 3 12 3Z" /></svg>
+            <span>Connection</span>
+          </button>
+          <button class="nav-item" type="button" data-page="routes">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 16L16 8" /><path d="M12 16L12 11" /><path d="M8 16L8 13" /><path d="M3 20.4V3.6C3 3.26863 3.26863 3 3.6 3H20.4C20.7314 3 21 3.26863 21 3.6V20.4C21 20.7314 20.7314 21 20.4 21H3.6C3.26863 21 3 20.7314 3 20.4Z" /></svg>
+            <span>Routes</span>
+          </button>
+        </nav>
+
+        <div class="titlebar-actions">
+          <div class="header-status" aria-live="polite">
+            <span class="mini-dot idle" data-status-dot></span>
+            <span id="header-status-text">Offline</span>
+          </div>
+          <button class="window-control" id="minimize" type="button" aria-label="Minimize window" title="Minimize">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12H18" /></svg>
+          </button>
+          <button class="window-control" id="close" type="button" aria-label="Close window" title="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.75827 17.2426L12.0009 12M17.2435 6.75736L12.0009 12M12.0009 12L6.75827 6.75736M12.0009 12L17.2435 17.2426" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="content" id="content">
+        <section class="page is-active" id="page-home" data-view="home">
+          <div class="page-heading">
+            <div class="eyebrow">SELECTIVE ROUTING</div>
+            <h1>Route only what you need.</h1>
+            <p>Send chosen IPv4 networks through your VPS while everything else stays on your normal ISP connection.</p>
+          </div>
+
+          <section class="hero-card" aria-live="polite">
+            <div class="hero-copy">
+              <div class="eyebrow">TUNNEL STATUS</div>
+              <h2 id="home-status-title">Not connected</h2>
+              <p id="home-status-detail">Configure a VPS and destination networks to get started.</p>
+              <button class="text-button" type="button" data-page="connection">Open connection settings <span aria-hidden="true">→</span></button>
+            </div>
+            <div class="hero-mark" aria-hidden="true">
+              <svg viewBox="0 0 160 160"><path d="M32 32h48v48H32zM80 80h48v48H80zM80 32h48v48H80zM32 80h48v48H32z" /><path class="hero-line" d="M56 80h48M80 56v48" /></svg>
+            </div>
+          </section>
+
+          <div class="card-grid">
+            <article class="info-card">
+              <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13L9 17L19 7" /></svg></div>
+              <h3>Private tunnel</h3>
+              <p>Authenticated QUIC transport protects the connection to your VPS.</p>
+            </article>
+            <article class="info-card">
+              <div class="card-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 16L16 8" /><path d="M12 16L12 11" /><path d="M8 16L8 13" /><path d="M3 20.4V3.6C3 3.26863 3.26863 3 3.6 3H20.4C20.7314 3 21 3.26863 21 3.6V20.4C21 20.7314 20.7314 21 20.4 21H3.6C3.26863 21 3 20.7314 3 20.4Z" /></svg></div>
+              <h3>Selective by design</h3>
+              <p>Only the IPv4 CIDRs you enter are routed through the VPS.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="page" id="page-connection" data-view="connection" hidden>
+          <div class="page-heading compact-heading">
+            <div class="eyebrow">TUNNEL SETUP</div>
+            <h1>Connection</h1>
+            <p>Use the values configured by your server administrator.</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2>VPS details</h2>
+                <p>One server can be shared with trusted friends using the same passphrase.</p>
+              </div>
+              <div class="panel-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12V18C5 18 5 21 12 21C19 21 19 18 19 18V12" /><path d="M5 6V12C5 12 5 15 12 15C19 15 19 12 19 12V6" /><path d="M12 3C19 3 19 6 19 6C19 6 19 9 12 9C5 9 5 6 5 6C5 6 5 3 12 3Z" /></svg></div>
+            </div>
+
+            <div class="form-grid">
+              <label class="field">
+                <span>VPS IPv4 address</span>
+                <input id="server" placeholder="203.0.113.10" autocomplete="off" inputmode="decimal" />
+              </label>
+              <label class="field">
+                <span>UDP port</span>
+                <input id="port" type="number" value="4433" min="1" max="65535" inputmode="numeric" />
+              </label>
+              <label class="field field-wide">
+                <span>Passphrase</span>
+                <input id="passphrase" type="password" autocomplete="current-password" />
+              </label>
+              <label class="field field-wide">
+                <span>Destination networks</span>
+                <textarea id="routes" rows="5" placeholder="203.0.113.0/24&#10;198.51.100.17/32"></textarea>
+              </label>
+            </div>
+
+            <div class="form-footer">
+              <p class="hint">One IPv4 CIDR per line. A default route is intentionally not allowed.</p>
+              <div class="actions">
+                <button class="button primary-action" id="connect" type="button">Connect</button>
+                <button class="button secondary-action" id="disconnect" type="button" disabled>Disconnect</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="status-card" aria-live="polite">
+            <span class="status-dot idle" data-status-dot></span>
+            <div>
+              <strong id="connection-status-title">Not connected</strong>
+              <p id="connection-status-detail">Routes stay on your normal connection.</p>
+            </div>
+          </section>
+        </section>
+
+        <section class="page" id="page-routes" data-view="routes" hidden>
+          <div class="page-heading compact-heading">
+            <div class="eyebrow">ROUTE POLICY</div>
+            <h1>Routes</h1>
+            <p>Review the IPv4 destination networks that will use the tunnel.</p>
+          </div>
+
+          <section class="panel route-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Selected networks</h2>
+                <p>Change these on the Connection page before connecting.</p>
+              </div>
+              <div class="panel-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 16L16 8" /><path d="M12 16L12 11" /><path d="M8 16L8 13" /><path d="M3 20.4V3.6C3 3.26863 3.26863 3 3.6 3H20.4C20.7314 3 21 3.26863 21 3.6V20.4C21 20.7314 20.7314 21 20.4 21H3.6C3.26863 21 3 20.7314 3 20.4Z" /></svg></div>
+            </div>
+            <ul class="route-list" id="route-list">
+              <li class="empty-state">No destination networks entered.</li>
+            </ul>
+          </section>
+
+          <div class="note-card">
+            <span class="note-mark">i</span>
+            <p>Asira Router never installs a default route, so ordinary browsing and other traffic continue using your ISP.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
