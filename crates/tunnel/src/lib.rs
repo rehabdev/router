@@ -2,7 +2,10 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -26,15 +29,19 @@ use sha2::Sha256;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tun::{create_as_async, AsyncDevice, TunPacketCodec};
+use tun::{create_as_async, AbstractDevice, AsyncDevice, TunPacketCodec};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const TUN_MTU: u16 = 1400;
+// Keep the IP MTU below QUIC's conservative minimum datagram payload so the
+// selected routes do not emit packets that QUIC cannot carry as one datagram.
+const TUN_MTU: u16 = 1200;
 const TUN_NETWORK: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 88, 0, 0), 24);
 const FIRST_CLIENT_HOST: u8 = 2;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-asira-router-auth-v1";
 const AUTH_EXPORTER_CONTEXT: &[u8] = b"asira-router-auth-v1";
 
@@ -71,7 +78,36 @@ pub struct ClientSession {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     route_manager: Option<RouteManager>,
+    task_error: Arc<Mutex<Option<String>>>,
+    metrics: Arc<ClientMetrics>,
     pub status: ClientStatus,
+}
+
+#[derive(Default)]
+struct ClientMetrics {
+    packets_sent: AtomicU64,
+    bytes_sent: AtomicU64,
+    packets_received: AtomicU64,
+    bytes_received: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ClientMetricsSnapshot {
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_received: u64,
+    pub bytes_received: u64,
+}
+
+impl ClientMetrics {
+    fn snapshot(&self) -> ClientMetricsSnapshot {
+        ClientMetricsSnapshot {
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -170,7 +206,9 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
                 .get(&destination)
                 .map(|session| session.connection.clone());
             if let Some(connection) = connection {
-                let _ = connection.send_datagram(Bytes::from(packet));
+                // Wait for QUIC datagram capacity instead of silently dropping
+                // return packets when the send queue is temporarily full.
+                let _ = connection.send_datagram_wait(Bytes::from(packet)).await;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -313,9 +351,12 @@ fn reserve_client_ip(
 pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(make_client_config()?);
-    let connection = endpoint
-        .connect(config.server, "asira-router")?
+    let connecting = endpoint
+        .connect(config.server, "asira-router")
+        .context("starting connection to VPS")?;
+    let connection = timeout(CONNECT_TIMEOUT, connecting)
         .await
+        .context("timed out connecting to VPS; check the VPS address and UDP port")?
         .context("connecting to VPS")?;
 
     let (mut send, mut recv) = connection.open_bi().await.context("opening auth stream")?;
@@ -360,16 +401,24 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
         Ipv4Addr::new(10, 88, 0, 1),
     )
     .context("creating Windows TUN device")?;
+    let tun_index = tun
+        .tun_index()
+        .context("reading Windows TUN interface index")?;
     let (tun_writer, tun_reader) = tun.split().context("splitting client TUN device")?;
     let mut tun_reader = FramedRead::new(tun_reader, TunPacketCodec::new(TUN_MTU as usize));
     let mut tun_writer = FramedWrite::new(tun_writer, TunPacketCodec::new(TUN_MTU as usize));
 
-    let route_manager = RouteManager::install(config.server, &config.routes)?;
+    let route_manager = RouteManager::install(config.server, &config.routes, tun_index)?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let connection_for_task = connection.clone();
     let allowed_routes = config.routes.clone();
+    let task_error = Arc::new(Mutex::new(None));
+    let task_error_for_task = Arc::clone(&task_error);
+    let metrics = Arc::new(ClientMetrics::default());
+    let metrics_for_task = Arc::clone(&metrics);
     let task = tokio::spawn(async move {
-        loop {
+        let result = async {
+            loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
                     connection_for_task.close(0u32.into(), b"client disconnect");
@@ -383,9 +432,18 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
                     }
                     let (source, destination) = validate_ipv4_packet(&packet).map_err(|err| anyhow!(err))?;
                     if source != assigned_ipv4 || !allowed_routes.iter().any(|route| route.contains(&destination)) {
-                        return Err(anyhow!("client TUN produced a packet outside its assigned source or route policy"));
+                        // Windows can emit housekeeping or locally generated IPv4 packets on a
+                        // Wintun interface. They must never cross the tunnel, but they also
+                        // must not tear down an otherwise healthy selective route session.
+                        continue;
                     }
-                    connection_for_task.send_datagram(Bytes::from(packet)).context("sending QUIC datagram")?;
+                    let packet_len = packet.len() as u64;
+                    connection_for_task
+                        .send_datagram_wait(Bytes::from(packet))
+                        .await
+                        .context("sending QUIC datagram")?;
+                    metrics_for_task.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    metrics_for_task.bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
                 }
                 packet = connection_for_task.read_datagram() => {
                     let packet = packet.context("reading QUIC datagram")?;
@@ -394,15 +452,27 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
                     }
                     validate_ipv4_packet(&packet).map_err(|err| anyhow!(err))?;
                     tun_writer.send(packet.to_vec()).await.context("writing packet to client TUN device")?;
+                    metrics_for_task.packets_received.fetch_add(1, Ordering::Relaxed);
+                    metrics_for_task.bytes_received.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 }
             }
         }
+        }
+        .await;
+        if let Err(error) = &result {
+            *task_error_for_task
+                .lock()
+                .expect("client task error state poisoned") = Some(format!("{error:#}"));
+        }
+        result
     });
 
     Ok(ClientSession {
         shutdown: Some(shutdown_tx),
         task: Some(task),
         route_manager: Some(route_manager),
+        task_error,
+        metrics,
         status: ClientStatus {
             assigned_ipv4,
             routes: config.routes,
@@ -411,21 +481,39 @@ pub async fn connect_client(config: ClientConfig) -> Result<ClientSession> {
 }
 
 impl ClientSession {
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .map(tokio::task::JoinHandle::is_finished)
+            .unwrap_or(true)
+    }
+
+    pub fn failure_message(&self) -> Option<String> {
+        self.task_error
+            .lock()
+            .expect("client task error state poisoned")
+            .clone()
+    }
+
+    pub fn metrics(&self) -> ClientMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
     pub async fn disconnect(mut self) -> Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let task_result = if let Some(task) = self.task.take() {
-            task.await.context("waiting for client tunnel shutdown")?
-        } else {
-            Ok(())
-        };
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
         let route_result = self
             .route_manager
             .take()
             .map(|route_manager| route_manager.remove())
             .unwrap_or(Ok(()));
-        task_result?;
+        // A deliberate disconnect closes QUIC while the packet task may still be
+        // waiting in read_datagram(). That expected transport error is not a
+        // cleanup failure; route removal is the result that matters here.
         route_result
     }
 }
@@ -444,10 +532,11 @@ impl Drop for ClientSession {
 struct RouteManager {
     routes: Vec<Ipv4Net>,
     gateway: Ipv4Addr,
+    interface_index: i32,
 }
 
 impl RouteManager {
-    fn install(server: SocketAddr, routes: &[Ipv4Net]) -> Result<Self> {
+    fn install(server: SocketAddr, routes: &[Ipv4Net], interface_index: i32) -> Result<Self> {
         match server.ip() {
             IpAddr::V4(_) => {}
             IpAddr::V6(_) => return Err(anyhow!("IPv6 server addresses are not supported")),
@@ -455,9 +544,9 @@ impl RouteManager {
         let gateway = Ipv4Addr::new(10, 88, 0, 1);
         let mut installed = Vec::new();
         for route in routes {
-            if let Err(error) = add_windows_route(*route, gateway) {
+            if let Err(error) = add_windows_route(*route, gateway, interface_index) {
                 for previous in installed {
-                    let _ = remove_windows_route(previous, gateway);
+                    let _ = remove_windows_route(previous, gateway, interface_index);
                 }
                 return Err(error);
             }
@@ -466,13 +555,14 @@ impl RouteManager {
         Ok(Self {
             routes: routes.to_vec(),
             gateway,
+            interface_index,
         })
     }
 
     fn remove(&self) -> Result<()> {
         let mut first_error = None;
         for route in &self.routes {
-            if let Err(error) = remove_windows_route(*route, self.gateway) {
+            if let Err(error) = remove_windows_route(*route, self.gateway, self.interface_index) {
                 first_error.get_or_insert(error);
             }
         }
@@ -481,7 +571,7 @@ impl RouteManager {
 }
 
 #[cfg(windows)]
-fn add_windows_route(route: Ipv4Net, gateway: Ipv4Addr) -> Result<()> {
+fn add_windows_route(route: Ipv4Net, gateway: Ipv4Addr, interface_index: i32) -> Result<()> {
     let output = std::process::Command::new("route")
         .args([
             "ADD",
@@ -489,24 +579,33 @@ fn add_windows_route(route: Ipv4Net, gateway: Ipv4Addr) -> Result<()> {
             "MASK",
             &route.netmask().to_string(),
             &gateway.to_string(),
+            "METRIC",
+            "1",
+            "IF",
+            &interface_index.to_string(),
         ])
         .output()
         .context("starting route.exe")?;
     if !output.status.success() {
-        return Err(anyhow!("route.exe could not add {}", route));
+        return Err(anyhow!(
+            "route.exe could not add {} through interface {}: {}",
+            route,
+            interface_index,
+            command_output(&output)
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn add_windows_route(_route: Ipv4Net, _gateway: Ipv4Addr) -> Result<()> {
+fn add_windows_route(_route: Ipv4Net, _gateway: Ipv4Addr, _interface_index: i32) -> Result<()> {
     Err(anyhow!(
         "the client route manager currently supports Windows only"
     ))
 }
 
 #[cfg(windows)]
-fn remove_windows_route(route: Ipv4Net, gateway: Ipv4Addr) -> Result<()> {
+fn remove_windows_route(route: Ipv4Net, gateway: Ipv4Addr, interface_index: i32) -> Result<()> {
     let _ = gateway;
     let output = std::process::Command::new("route")
         .args([
@@ -514,18 +613,38 @@ fn remove_windows_route(route: Ipv4Net, gateway: Ipv4Addr) -> Result<()> {
             &route.network().to_string(),
             "MASK",
             &route.netmask().to_string(),
+            "IF",
+            &interface_index.to_string(),
         ])
         .output()
         .context("starting route.exe")?;
     if !output.status.success() {
-        return Err(anyhow!("route.exe could not remove {}", route));
+        return Err(anyhow!(
+            "route.exe could not remove {} through interface {}: {}",
+            route,
+            interface_index,
+            command_output(&output)
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn remove_windows_route(_route: Ipv4Net, _gateway: Ipv4Addr) -> Result<()> {
+fn remove_windows_route(_route: Ipv4Net, _gateway: Ipv4Addr, _interface_index: i32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn command_output(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
 }
 
 fn create_tun(
@@ -543,11 +662,36 @@ fn create_tun(
         .destination(peer)
         .mtu(TUN_MTU)
         .up();
+    #[cfg(target_os = "windows")]
+    {
+        let wintun_path = locate_wintun_dll()?;
+        config.platform_config(|platform| platform.wintun_file(wintun_path));
+    }
     #[cfg(target_os = "linux")]
     config.platform_config(|platform| {
         platform.ensure_root_privileges(true);
     });
-    create_as_async(&config).map_err(Into::into)
+    create_as_async(&config).context("opening configured TUN device")
+}
+
+#[cfg(target_os = "windows")]
+fn locate_wintun_dll() -> Result<std::path::PathBuf> {
+    let executable = std::env::current_exe().context("locating Asira Router executable")?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| anyhow!("Asira Router executable has no parent directory"))?;
+    let candidates = [
+        directory.join("wintun.dll"),
+        directory.join("resources").join("wintun.dll"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow!(
+                "Wintun runtime is missing; reinstall Asira Router so wintun.dll is installed with the app"
+            )
+        })
 }
 
 fn prefix_to_netmask(prefix: u8) -> Result<Ipv4Addr> {
@@ -613,27 +757,42 @@ async fn read_control_message<T: serde::de::DeserializeOwned>(
 }
 
 fn make_server_endpoint(config: &ServerConfig) -> Result<Endpoint> {
+    install_crypto_provider();
     let (cert_der, key_der) =
         load_or_create_certificate(&config.certificate_path, &config.key_path)?;
     let cert_chain = vec![CertificateDer::from(cert_der)];
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_der));
     let mut server_config = quinn::ServerConfig::with_single_cert(cert_chain, key)?;
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(1u32.into());
-    transport.max_concurrent_uni_streams(0u32.into());
-    transport.datagram_receive_buffer_size(Some(1024 * 1024));
-    transport.datagram_send_buffer_size(1024 * 1024);
-    server_config.transport_config(Arc::new(transport));
+    server_config.transport_config(Arc::new(transport_config()));
     Ok(Endpoint::server(server_config, config.bind)?)
 }
 
 fn make_client_config() -> Result<quinn::ClientConfig> {
+    install_crypto_provider();
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
-    Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+    client_config.transport_config(Arc::new(transport_config()));
+    Ok(client_config)
+}
+
+fn transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(1u32.into());
+    transport.max_concurrent_uni_streams(0u32.into());
+    transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    transport.datagram_receive_buffer_size(Some(1024 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
+    transport
+}
+
+fn install_crypto_provider() {
+    // Quinn and other dependencies may enable more than one Rustls provider.
+    // Select ring explicitly so a GUI command cannot panic while building TLS.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn load_or_create_certificate(cert_path: &str, key_path: &str) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -729,4 +888,14 @@ fn default_cert_path() -> String {
 
 fn default_key_path() -> String {
     "/etc/asira-router/server.key.der".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_client_config;
+
+    #[test]
+    fn client_crypto_provider_is_available() {
+        make_client_config().expect("client TLS configuration should be constructible");
+    }
 }
