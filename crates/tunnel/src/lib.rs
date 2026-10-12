@@ -544,7 +544,9 @@ fn create_tun(
         .mtu(TUN_MTU)
         .up();
     #[cfg(target_os = "linux")]
-    config.platform_config(|platform| platform.ensure_root_privileges(true));
+    config.platform_config(|platform| {
+        platform.ensure_root_privileges(true);
+    });
     create_as_async(&config).map_err(Into::into)
 }
 
