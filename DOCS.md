@@ -31,11 +31,24 @@ less install-server.sh
 sudo bash install-server.sh
 ```
 
+Because this repository is private, create a fine-grained GitHub token with
+read-only access to this repository before installing on a VPS. Keep it only
+in the current shell and pass it through the environment; the installer uses it
+only for downloading the release assets and never writes it to disk:
+
+```text
+export GITHUB_TOKEN='paste-your-read-only-token-here'
+sudo -E bash install-server.sh
+unset GITHUB_TOKEN
+```
+
+For a public repository, omit `GITHUB_TOKEN` and run `sudo bash install-server.sh`.
+
 The installer verifies the package SHA-256 checksum, installs
 `/usr/local/bin/asira-server`, creates a systemd service, creates the protected
 config at `/etc/asira-router/server.toml`, prompts for the shared passphrase,
 and starts the service. For a specific release, add
-`--version v0.1.0 --repository rehabdev/router` to the installer command.
+`--version v0.1.2 --repository rehabdev/router` to the installer command.
 It intentionally does not change forwarding or firewall rules because the
 public network interface differs between VPS providers.
 
