@@ -8,6 +8,7 @@ readonly SERVICE_PATH="/etc/systemd/system/asira-router.service"
 
 repository="${ASIRA_ROUTER_REPOSITORY:-$DEFAULT_REPOSITORY}"
 version="${ASIRA_ROUTER_VERSION:-latest}"
+github_token="${GITHUB_TOKEN:-}"
 
 usage() {
     cat <<'EOF'
@@ -16,6 +17,7 @@ Usage: install-server.sh [--repository OWNER/REPOSITORY] [--version TAG]
 Environment equivalents:
   ASIRA_ROUTER_REPOSITORY  GitHub repository, for example asira/router
   ASIRA_ROUTER_VERSION     Release tag, for example v0.1.0 (default: latest)
+  GITHUB_TOKEN             Optional GitHub token for a private repository
 EOF
 }
 
@@ -75,10 +77,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+curl_args=(
+    --fail --silent --show-error --location
+    --proto '=https' --tlsv1.2
+)
+if [[ -n "$github_token" ]]; then
+    curl_args+=(--header "Authorization: Bearer $github_token")
+fi
+
 echo "Downloading Asira Router server ($version)..."
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+curl "${curl_args[@]}" \
     --output "$temporary_directory/$asset" "$release_base/$asset"
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+curl "${curl_args[@]}" \
     --output "$temporary_directory/SHA256SUMS" "$release_base/SHA256SUMS"
 
 expected_checksum="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$temporary_directory/SHA256SUMS")"
