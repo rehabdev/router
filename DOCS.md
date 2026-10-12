@@ -31,10 +31,10 @@ less install-server.sh
 sudo bash install-server.sh
 ```
 
-Because this repository is private, create a fine-grained GitHub token with
-read-only access to this repository before installing on a VPS. Keep it only
-in the current shell and pass it through the environment; the installer uses it
-only for downloading the release assets and never writes it to disk:
+This repository is public, so no GitHub token is needed. If you later move the
+repository to a private one, pass a read-only token only for the installation
+command; the installer uses it for release downloads and never writes it to
+disk:
 
 ```text
 export GITHUB_TOKEN='paste-your-read-only-token-here'
@@ -42,7 +42,7 @@ sudo -E bash install-server.sh
 unset GITHUB_TOKEN
 ```
 
-For a public repository, omit `GITHUB_TOKEN` and run `sudo bash install-server.sh`.
+For the current public repository, simply run `sudo bash install-server.sh`.
 
 The installer verifies the package SHA-256 checksum, installs
 `/usr/local/bin/asira-server`, creates a systemd service, creates the protected
@@ -109,10 +109,10 @@ the VPS firewall automatically.
 
 The client requires:
 
-- Windows 10 or newer, IPv4 connectivity, and administrator privileges.
-- The `wintun.dll` matching the application's architecture beside the client
-  executable. Download it from the official WireGuard/Wintun distribution and
-  verify its origin before packaging it.
+- Windows 10 or newer and IPv4 connectivity.
+- The packaged Windows installer includes the official 64-bit `wintun.dll`.
+  The client requests administrator privileges because Windows requires them
+  to create the adapter and install routes.
 - A VPS IP address, the configured UDP port, the shared passphrase, and one or
   more destination CIDRs.
 
@@ -172,6 +172,18 @@ not prove that a provider's routing or firewall policy permits the tunnel.
 ## Current limitations
 
 - IPv4 only.
+- The tunnel uses a conservative 1200-byte IP MTU so packets fit inside the
+  QUIC datagram transport without fragmentation-related failures.
+- QUIC keepalives run every five seconds so an idle game route does not expire
+  at the transport's default idle timeout before the next packet is sent.
+- The client also sends a small tunnel liveness marker every five seconds. The
+  VPS consumes it before packet-policy validation, so it never enters the TUN
+  device or forwards general user traffic. The negotiated QUIC idle ceiling is
+  ten minutes to tolerate transient provider/NAT silence without immediately
+  tearing down an authenticated session.
+- The VPS drops malformed or out-of-policy client packets without terminating
+  the authenticated tunnel; this keeps harmless TUN housekeeping traffic from
+  causing a client-visible reset.
 - One shared passphrase; there is no per-device revocation.
 - The MVP does not yet pin the server's self-signed QUIC certificate. The
   channel is encrypted with QUIC TLS. The server certificate is self-signed,

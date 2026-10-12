@@ -44,6 +44,35 @@ The repository contains:
     write the shared passphrase as plaintext; use OS-protected storage.
 13. Keep release packages reproducible and checksum-verified. Installation
     must not silently change provider-specific forwarding or firewall policy.
+14. Bound every client connection attempt and surface a useful error when the
+    VPS cannot be reached. A network hang must never leave the GUI in an
+    indefinite connecting state.
+15. Select the Rustls crypto provider explicitly before building QUIC TLS
+    configuration. Dependency feature unification can otherwise leave the
+    provider ambiguous and panic inside a GUI command.
+16. Treat Wintun as a packaged runtime dependency on Windows. Resolve it from
+    the executable's install directory, request administrator elevation, and
+    never silently fall back to loading a DLL from the working directory.
+17. Bind every selective Windows route to the AsiraRouter interface index
+    explicitly. Relying on Windows to infer the interface from the gateway can
+    leave a successful tunnel handshake with no usable traffic route.
+18. Treat IPv4 packets read from the Windows TUN that do not match the assigned
+    source and selected destination CIDRs as drop-only housekeeping traffic.
+    Never forward them, but do not tear down the whole selective session.
+19. Intentional client disconnects must always finish local route cleanup even
+    when the QUIC reader reports the expected connection-closed error.
+20. Keep the Windows and Linux TUN MTU below the negotiated QUIC datagram
+    ceiling and use back-pressure-aware datagram sends; an oversized or full
+    QUIC datagram queue must not silently break the selective tunnel.
+21. Configure an explicit QUIC keepalive for the long-lived tunnel. The default
+    idle timeout can close an otherwise healthy selective session and leave the
+    GUI looking connected without a usable route.
+22. Drop malformed, oversized, or policy-invalid client datagrams on the VPS
+    without tearing down the authenticated session. A single housekeeping
+    packet must not reset an otherwise usable tunnel.
+23. Keep an application-level liveness marker separate from tunneled IPv4 data.
+    It may preserve a selective session across provider/NAT idle expiry, but it
+    must be consumed before either TUN device and never count as user traffic.
 
 ## Validation before handing off
 
