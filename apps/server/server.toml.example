@@ -1,0 +1,7 @@
+bind = "0.0.0.0:4433"
+passphrase = "replace-this-with-a-long-random-passphrase"
+tun_name = "asira0"
+tun_address = "10.88.0.1"
+certificate_path = "/etc/asira-router/server.crt.der"
+key_path = "/etc/asira-router/server.key.der"
+
