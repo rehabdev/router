@@ -17,7 +17,7 @@ version = "0.1.0"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
 hmac = "0.12"
 ipnet = "2"
 quinn = "0.11"
